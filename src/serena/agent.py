@@ -9,6 +9,8 @@ import platform
 import sys
 import traceback
 from abc import ABC
+import pathlib
+import yaml
 from collections import defaultdict
 from collections.abc import Callable, Generator, Iterable
 from logging import Logger
@@ -122,15 +124,27 @@ class ProjectConfig(ToStringMixin):
 @singleton
 class SerenaConfig:
     """
-    Handles user-defined Serena configuration based on the configuration file
+    Loads and manages Serena's main configuration.
+    Searches for the config file in standard locations:
+    1. $XDG_CONFIG_HOME/serena/serena_config.yml
+    2. ~/.config/serena/serena_config.yml
+    3. ./serena_config.yml (current working directory)
     """
 
     CONFIG_FILE = "serena_config.yml"
 
     def __init__(self) -> None:
-        config_file = os.path.join(serena_root_path(), self.CONFIG_FILE)
-        if not os.path.exists(config_file):
-            raise FileNotFoundError(f"Serena configuration file not found: {config_file}")
+        # Determine the configuration file path
+        config_file = self._find_config_file()
+
+        if not config_file:
+            # Construct a helpful error message listing the checked locations
+            checked_locations = self._get_potential_config_locations()
+            locations_str = "\n - ".join(map(str, checked_locations))
+            raise FileNotFoundError(
+                f"Serena configuration file '{self.CONFIG_FILE}' not found. Checked locations:\n - {locations_str}"
+            )
+
         with open(config_file, encoding="utf-8") as f:
             try:
                 log.info(f"Loading Serena configuration from {config_file}")
@@ -141,15 +155,18 @@ class SerenaConfig:
         # read projects
         self.projects: dict[str, ProjectConfig] = {}
         if "projects" not in config_yaml:
-            raise SerenaConfigError("`projects` key not found in Serena configuration. Please update your `serena_config.yml` file.")
+            raise SerenaConfigError(f"`projects` key not found in Serena configuration file: {config_file}")
+
+        # Determine base directory for relative project paths (directory of the loaded config file)
+        config_dir = config_file.parent
         for project_config_path in config_yaml["projects"]:
             project_config_path = Path(project_config_path)
             if not project_config_path.is_absolute():
-                project_config_path = Path(serena_root_path()) / project_config_path
+                project_config_path = (config_dir / project_config_path).resolve()
             if project_config_path.is_dir():  # assume project file in default location
                 project_config_path = project_config_path / ProjectConfig.SERENA_MANAGED_DIR / ProjectConfig.SERENA_DEFAULT_PROJECT_FILE
             if not project_config_path.is_file():
-                raise FileNotFoundError(f"Project file not found: {project_config_path}")
+                raise FileNotFoundError(f"Project file not found: {project_config_path} (referenced in {config_file})")
             log.info(f"Loading project configuration from {project_config_path}")
             project_config = ProjectConfig.from_yml(project_config_path)
             self.projects[project_config.project_name] = project_config
@@ -158,6 +175,34 @@ class SerenaConfig:
         self.gui_log_window_enabled = config_yaml.get("gui_log_window", False)
         self.gui_log_window_level = config_yaml.get("gui_log_level", logging.INFO)
         self.enable_project_activation = config_yaml.get("enable_project_activation", True)
+
+
+    def _get_potential_config_locations(self) -> list[Path]:
+        """Returns a list of potential configuration file paths in search order."""
+        potential_paths: list[Path] = []
+        app_config_dir_name = "serena" # Standard practice subdirectory
+
+        # 1. $XDG_CONFIG_HOME/serena/serena_config.yml
+        xdg_config_home = os.environ.get("XDG_CONFIG_HOME")
+        if xdg_config_home:
+            # Per XDG spec, use $XDG_CONFIG_HOME directly if set
+            potential_paths.append(Path(xdg_config_home) / app_config_dir_name / self.CONFIG_FILE)
+        else:
+            # 2. ~/.config/serena/serena_config.yml (XDG Base Directory Specification default)
+            potential_paths.append(Path.home() / ".config" / app_config_dir_name / self.CONFIG_FILE)
+
+        # 3. serena_root_path()/serena_config.yml
+        potential_paths.append(Path(serena_root_path()) / self.CONFIG_FILE)
+
+        return potential_paths
+
+    def _find_config_file(self) -> Path | None:
+        """Finds the serena config file in standard locations."""
+        for potential_path in self._get_potential_config_locations():
+            log.debug(f"Checking for config file at: {potential_path}")
+            if potential_path.is_file():
+                return potential_path
+        return None
 
     def get_project_configuration(self, project_name: str) -> ProjectConfig:
         if project_name not in self.projects:
